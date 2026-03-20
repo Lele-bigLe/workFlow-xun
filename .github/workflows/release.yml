@@ -22,8 +22,6 @@ jobs:
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
 
       - name: Rust 编译缓存
         uses: swatinem/rust-cache@v2
@@ -33,12 +31,8 @@ jobs:
       - name: 安装前端依赖
         run: npm install
 
-      - name: 构建前端
-        run: npm run build
-
-      - name: 构建 Rust 二进制
-        run: cargo build --release --target x86_64-pc-windows-msvc
-        working-directory: src-tauri
+      - name: 构建（无安装包）
+        run: npx tauri build --no-bundle
 
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
@@ -49,7 +43,7 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/workflow-ui.exe
-            src-tauri/target/x86_64-pc-windows-msvc/release/workFlow.exe
+            src-tauri/target/release/workflow-ui.exe
+            src-tauri/target/release/workFlow.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
