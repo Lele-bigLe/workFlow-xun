@@ -56,16 +56,17 @@ src/
 
 进入 `src-tauri` 目录执行：
 
-## 运行ui
-npm run tauri dev
-
+## 运行
 
 ```bash
+# 开发调试（GUI 热重载）
+npm run tauri dev
+
+# 一次性构建双 exe（workFlow.exe + workflow-ui.exe）
+npx tauri build --no-bundle
+
 # 仅编译 MCP Server
 cargo build --release --bin workFlow
-
-# 编译 GUI（Tauri 桌面应用）
-npx tauri build
 ```
 
 构建产物位于 `src-tauri/target/release/`。
