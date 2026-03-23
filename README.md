@@ -87,6 +87,30 @@ npx tauri build
 
 配置完成后重启 VS Code，Copilot Chat 中即可自动调用 `mcp_workFlow_hint` 和 `mcp_workFlow_check`。
 
+## MCP 工具返回字段说明
+
+### `mcp_workFlow_hint` 返回
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `complexity` | string | 任务复杂度（simple/medium/complex），决定执行深度和必要步骤 |
+| `suggested_steps` | array | 建议执行的步骤列表，按顺序逐步执行。每项含 `id`（步骤标识）、`name`（显示名）、`action`（具体执行指令）、`skip_conditions`（AI 自主判断的白话跳过条件） |
+| `skipped_steps` | array | 已被引擎跳过的步骤，含 `id` 和 `reason`（跳过原因），无需执行 |
+| `loop_info` | object/null | 循环回退信息。`loop_node_id`=触发循环的节点、`loop_back_to`=回退目标节点、`re_execute_nodes`=循环时需重新执行的节点列表。为 null 表示无循环 |
+| `reminder` | string | 根据复杂度生成的执行提醒 |
+| `progress_display` | string | Markdown 格式的进度清单（checkbox 列表），可直接展示给用户 |
+
+### `mcp_workFlow_check` 返回
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `passed` | boolean | 是否通过检查（true=所有建议步骤已完成） |
+| `missing_steps` | array | 尚未完成的步骤列表，每项含 `id`、`name`、`action` |
+| `completed_steps` | array | 已完成的步骤 ID 列表（传入参数的回显） |
+| `loop_info` | object/null | 与 hint 相同的循环回退信息 |
+| `message` | string | 检查结果文字摘要（✅ 通过 或 ⚠️ 遗漏提示） |
+| `progress_display` | string | 带完成状态的 Markdown checkbox 进度清单 |
+
 ## 自定义工作流 (workflow.yaml)
 
 Xun 在启动时按以下优先级读取配置：

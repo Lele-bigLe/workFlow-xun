@@ -111,7 +111,10 @@ impl ServerHandler for XunServer {
             tools.push(Tool {
                 name: Cow::Borrowed("hint"),
                 description: Cow::Borrowed(
-                    "【强制】任务开始前必须调用此工具。根据任务描述返回：执行步骤列表、可跳过步骤、复杂度评估。不调用直接执行 = 违规。"
+                    "【强制】任务开始前必须调用此工具。根据任务描述返回：\
+                    complexity（复杂度）、suggested_steps（建议步骤列表，含 id/name/action/skip_conditions）、\
+                    skipped_steps（已跳过步骤及原因）、loop_info（循环回退信息，含 loop_node_id/loop_back_to/re_execute_nodes）、\
+                    reminder（执行提醒）、progress_display（Markdown 进度清单）。不调用直接执行 = 违规。"
                 ),
                 input_schema: Arc::new(schema_map),
             });
@@ -142,7 +145,10 @@ impl ServerHandler for XunServer {
             tools.push(Tool {
                 name: Cow::Borrowed("check"),
                 description: Cow::Borrowed(
-                    "【建议】任务完成前调用，传入已完成步骤 ID 列表，检查是否遗漏建议步骤。返回 passed=false 表示有遗漏。"
+                    "【建议】任务完成前调用，传入已完成步骤 ID 列表，检查是否遗漏建议步骤。返回：\
+                    passed（是否通过）、missing_steps（遗漏步骤列表，含 id/name/action）、\
+                    completed_steps（已完成列表回显）、loop_info（循环回退信息）、\
+                    message（检查结果摘要）、progress_display（带完成状态的 Markdown 进度清单）。"
                 ),
                 input_schema: Arc::new(schema_map),
             });

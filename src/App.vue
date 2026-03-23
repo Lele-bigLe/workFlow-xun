@@ -180,7 +180,27 @@ const mcpUsagePrompt = `## Xun Workflow MCP 使用指南
 1. 每个任务开始前，必须调用 \`mcp_workFlow_hint\` 获取工作流建议
 2. 按返回的 \`suggested_steps\` 逐步执行
 3. 任务完成前，可调用 \`mcp_workFlow_check\` 自检
-4. 代码完成后调用寸止(zhi)工具获取用户反馈，循环到用户说「结束」`;
+4. 代码完成后调用寸止(zhi)工具获取用户反馈，循环到用户说「结束」
+
+### hint 返回字段说明
+| 字段 | 说明 |
+|------|------|
+| complexity | 任务复杂度（simple/medium/complex），决定执行深度 |
+| suggested_steps | 建议步骤列表（按序执行），每项含 id、name、action、skip_conditions |
+| skipped_steps | 已跳过的步骤及原因（无需执行） |
+| loop_info | 循环回退信息：loop_node_id（触发节点）、loop_back_to（回退目标）、re_execute_nodes（重执行列表），为 null 表示无循环 |
+| reminder | 根据复杂度生成的执行提醒 |
+| progress_display | Markdown checkbox 进度清单，可直接展示给用户 |
+
+### check 返回字段说明
+| 字段 | 说明 |
+|------|------|
+| passed | 是否通过（true=所有建议步骤已完成） |
+| missing_steps | 遗漏的步骤列表（含 id、name、action） |
+| completed_steps | 已完成步骤 ID 列表（传入参数回显） |
+| loop_info | 与 hint 相同的循环回退信息 |
+| message | 检查结果文字摘要 |
+| progress_display | 带完成状态的 Markdown 进度清单 |`;
 
 function togglePromptPanel() {
   showPromptPanel.value = !showPromptPanel.value;

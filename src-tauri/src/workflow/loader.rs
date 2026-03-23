@@ -168,7 +168,29 @@ pub fn generate_workflow_rules_text(definition: &WorkflowDefinition) -> String {
     text.push_str("## 自定义跳过条件（AI 自主判研）\n\n");
     text.push_str("当 `hint` 返回的 `suggested_steps` 中包含 `skip_conditions` 字段时，\n");
     text.push_str("这些是用户自定义的白话跳过条件。你需要根据当前任务描述，\n");
-    text.push_str("自主判断是否满足这些条件。若满足，可合理跳过该步骤。\n");
+    text.push_str("自主判断是否满足这些条件。若满足，可合理跳过该步骤。\n\n");
+
+    // hint 返回字段说明
+    text.push_str("## hint 返回字段说明\n\n");
+    text.push_str("| 字段 | 类型 | 说明 |\n");
+    text.push_str("|------|------|------|\n");
+    text.push_str("| `complexity` | string | 任务复杂度（simple/medium/complex），决定执行深度和必要步骤 |\n");
+    text.push_str("| `suggested_steps` | array | 建议执行的步骤列表，按顺序逐步执行。每项含 `id`（步骤标识）、`name`（显示名）、`action`（具体执行指令）、`skip_conditions`（AI 自主判断的白话跳过条件） |\n");
+    text.push_str("| `skipped_steps` | array | 已被引擎跳过的步骤，含 `id` 和 `reason`（跳过原因），无需执行 |\n");
+    text.push_str("| `loop_info` | object/null | 循环回退信息。`loop_node_id`=触发循环的节点、`loop_back_to`=回退目标节点、`re_execute_nodes`=循环时需重新执行的节点列表。为 null 表示无循环 |\n");
+    text.push_str("| `reminder` | string | 根据复杂度生成的执行提醒，建议遵循 |\n");
+    text.push_str("| `progress_display` | string | Markdown 格式的进度清单（checkbox 列表），可直接展示给用户 |\n\n");
+
+    // check 返回字段说明
+    text.push_str("## check 返回字段说明\n\n");
+    text.push_str("| 字段 | 类型 | 说明 |\n");
+    text.push_str("|------|------|------|\n");
+    text.push_str("| `passed` | boolean | 是否通过检查（true=所有建议步骤已完成） |\n");
+    text.push_str("| `missing_steps` | array | 尚未完成的步骤列表，每项含 `id`、`name`、`action` |\n");
+    text.push_str("| `completed_steps` | array | 已完成的步骤 ID 列表（即传入参数的回显） |\n");
+    text.push_str("| `loop_info` | object/null | 与 hint 相同的循环回退信息 |\n");
+    text.push_str("| `message` | string | 检查结果的文字摘要（✅ 通过 或 ⚠️ 遗漏提示） |\n");
+    text.push_str("| `progress_display` | string | 带完成状态的 Markdown checkbox 进度清单 |\n");
 
     text
 }
