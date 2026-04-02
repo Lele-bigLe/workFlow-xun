@@ -172,12 +172,16 @@ impl ServerHandler for XunServer {
 
         match request.name.as_ref() {
             "hint" => {
+                let hint_request: HintRequest = match serde_json::from_value(arguments_value) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        let msg = format!("hint 参数解析失败: {}。请确保传入 task_description(string) 字段。", e);
+                        log::warn!("{}", msg);
+                        return Ok(CallToolResult::error(vec![Content::text(msg)]));
+                    }
+                };
+
                 let workflow_def = crate::workflow::loader::load_workflow_definition();
-                
-                let hint_request: HintRequest = serde_json::from_value(arguments_value)
-                    .map_err(|e| {
-                        McpError::invalid_params(format!("参数解析失败: {}", e), None)
-                    })?;
 
                 let result: WorkflowHintResult = evaluate_workflow(
                     &workflow_def,
@@ -185,10 +189,14 @@ impl ServerHandler for XunServer {
                     hint_request.complexity.as_deref(),
                 );
 
-                let result_json = serde_json::to_string_pretty(&result)
-                    .map_err(|e| {
-                        McpError::internal_error(format!("结果序列化失败: {}", e), None)
-                    })?;
+                let result_json = match serde_json::to_string_pretty(&result) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        let msg = format!("hint 结果序列化失败: {}", e);
+                        log::error!("{}", msg);
+                        return Ok(CallToolResult::error(vec![Content::text(msg)]));
+                    }
+                };
 
                 log::info!(
                     "hint: task=\"{}\" → complexity={}",
@@ -199,12 +207,16 @@ impl ServerHandler for XunServer {
                 Ok(CallToolResult::success(vec![Content::text(result_json)]))
             }
             "check" => {
+                let check_request: CheckRequest = match serde_json::from_value(arguments_value) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        let msg = format!("check 参数解析失败: {}。请确保传入 task_description(string) 和 completed_steps(array) 字段。", e);
+                        log::warn!("{}", msg);
+                        return Ok(CallToolResult::error(vec![Content::text(msg)]));
+                    }
+                };
+
                 let workflow_def = crate::workflow::loader::load_workflow_definition();
-                
-                let check_request: CheckRequest = serde_json::from_value(arguments_value)
-                    .map_err(|e| {
-                        McpError::invalid_params(format!("参数解析失败: {}", e), None)
-                    })?;
 
                 let result = check_workflow(
                     &workflow_def,
@@ -213,10 +225,14 @@ impl ServerHandler for XunServer {
                     &check_request.completed_steps,
                 );
 
-                let result_json = serde_json::to_string_pretty(&result)
-                    .map_err(|e| {
-                        McpError::internal_error(format!("结果序列化失败: {}", e), None)
-                    })?;
+                let result_json = match serde_json::to_string_pretty(&result) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        let msg = format!("check 结果序列化失败: {}", e);
+                        log::error!("{}", msg);
+                        return Ok(CallToolResult::error(vec![Content::text(msg)]));
+                    }
+                };
 
                 log::info!(
                     "check: passed={}, missing={}",
@@ -226,22 +242,28 @@ impl ServerHandler for XunServer {
 
                 Ok(CallToolResult::success(vec![Content::text(result_json)]))
             }
-            _ => Err(McpError::invalid_request(
-                format!("未知的工具: {}", request.name),
-                None,
-            )),
+            _ => {
+                let msg = format!("未知的工具: {}。可用工具: hint, check", request.name);
+                log::warn!("{}", msg);
+                Ok(CallToolResult::error(vec![Content::text(msg)]))
+            }
         }
     }
 }
 
 pub async fn run_workflow_server() -> Result<(), Box<dyn std::error::Error>> {
-    let service = XunServer::new()
+    let server = XunServer::new();
+    log::info!("XunServer 初始化完成，准备启动 stdio 传输");
+
+    let service = server
         .serve(stdio())
         .await
         .inspect_err(|e| {
             log::error!("启动循(Xun) MCP 服务器失败: {}", e);
         })?;
 
+    log::info!("MCP stdio 传输已建立，等待请求...");
     service.waiting().await?;
+    log::info!("MCP 服务器正常退出");
     Ok(())
 }
