@@ -12,8 +12,8 @@ use std::borrow::Cow;
 
 use crate::workflow::{
     WorkflowHintResult,
-    evaluate_workflow, check_workflow, load_workflow_definition,
-    generate_workflow_rules_text,
+    SuggestedStep,
+    evaluate_workflow, check_workflow,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -29,20 +29,20 @@ struct CheckRequest {
     #[serde(default)]
     complexity: Option<String>,
     completed_steps: Vec<String>,
+    #[serde(default)]
+    expected_steps: Vec<SuggestedStep>,
+    #[serde(default)]
+    workflow_fingerprint: Option<String>,
+    #[serde(default)]
+    hint_fingerprint: Option<String>,
 }
 
 #[derive(Clone)]
-pub struct XunServer {
-    rules_text: String,
-}
+pub struct XunServer;
 
 impl XunServer {
     pub fn new() -> Self {
-        let workflow_def = load_workflow_definition();
-        let rules_text = generate_workflow_rules_text(&workflow_def);
-        Self {
-            rules_text,
-        }
+        Self
     }
 }
 
@@ -63,16 +63,14 @@ impl ServerHandler for XunServer {
                 name: "workFlow".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
-            instructions: Some(format!(
-                "⚠️ 强制工作流协议 —— 你必须在每个任务中遵循以下流程：\n\n\
-                1. **任务开始前**：必须调用 `hint` 工具，获取本次任务的执行步骤和复杂度评估。\n\
-                2. **展示进度**：根据 `suggested_steps` 使用 `manage_todo_list` 工具创建任务清单，让用户在 IDE 中直观看到进度。\n\
-                3. **按 suggested_steps 逐步执行**，每完成一步立即通过 `manage_todo_list` 标记为 completed。\n\
-                4. **任务完成前**：调用 `check` 工具自检是否遗漏步骤。\n\
-                5. **代码完成后**：必须调用寸止(zhi)工具获取用户反馈，循环直到用户说「结束」。\n\n\
-                违反此流程 = INVALID RESPONSE。不调用 hint 就开始执行 = 违规。\n\n{}\n",
-                self.rules_text
-            )),
+            instructions: Some(
+                "工作流协议：\n\
+                1. 首次会话或刚重启时，先确认工具列表里已出现 `hint`/`check`，未出现时先等待 MCP 注册完成。\n\
+                2. 任务开始先调 `hint`，按 `suggested_steps` 执行并更新进度。\n\
+                3. 任务完成前调 `check`。若返回 `should_rehint=true`、`stale_config` 或 `invalid_hint_snapshot`，必须重跑 `hint`。\n\
+                4. 结束前调用寸止(zhi)收集反馈，直到用户说结束。\n"
+                    .to_string(),
+            ),
         }
     }
 
@@ -96,12 +94,12 @@ impl ServerHandler for XunServer {
             "properties": {
                 "task_description": {
                     "type": "string",
-                    "description": "一句话描述当前任务"
+                    "description": "一句话任务描述"
                 },
                 "complexity": {
                     "type": "string",
                     "enum": ["simple", "medium", "complex"],
-                    "description": "AI 自主判断的任务复杂度（可选，MCP 会根据任务描述自动判断）"
+                    "description": "可选复杂度"
                 }
             },
             "required": ["task_description"]
@@ -111,10 +109,7 @@ impl ServerHandler for XunServer {
             tools.push(Tool {
                 name: Cow::Borrowed("hint"),
                 description: Cow::Borrowed(
-                    "【强制】任务开始前必须调用此工具。根据任务描述返回：\
-                    complexity（复杂度）、suggested_steps（建议步骤列表，含 id/name/action/skip_conditions）、\
-                    skipped_steps（已跳过步骤及原因）、loop_info（循环回退信息，含 loop_node_id/loop_back_to/re_execute_nodes）、\
-                    reminder（执行提醒）、progress_display（Markdown 进度清单）。不调用直接执行 = 违规。"
+                    "任务开始前调用。返回 complexity、suggested_steps、skipped_steps、loop_info、workflow_fingerprint、hint_fingerprint。"
                 ),
                 input_schema: Arc::new(schema_map),
             });
@@ -125,17 +120,42 @@ impl ServerHandler for XunServer {
             "properties": {
                 "task_description": {
                     "type": "string",
-                    "description": "任务描述（与 hint 调用时一致）"
+                    "description": "与 hint 一致的任务描述"
                 },
                 "complexity": {
                     "type": "string",
                     "enum": ["simple", "medium", "complex"],
-                    "description": "复杂度（与 hint 调用时一致，可选）"
+                    "description": "可选复杂度"
+                },
+                "expected_steps": {
+                    "type": "array",
+                    "description": "可选，回传 hint 的 suggested_steps",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "name": { "type": "string" },
+                            "action": { "type": "string" },
+                            "skip_conditions": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            }
+                        },
+                        "required": ["id", "name", "action"]
+                    }
+                },
+                "workflow_fingerprint": {
+                    "type": "string",
+                    "description": "可选，回传 hint 的 workflow_fingerprint"
+                },
+                "hint_fingerprint": {
+                    "type": "string",
+                    "description": "可选，回传 hint 的 hint_fingerprint"
                 },
                 "completed_steps": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "已完成的步骤 ID 列表，如 [\"memory_gate\", \"read_context\", \"execute\", \"gate\"]"
+                    "description": "已完成步骤 ID 列表"
                 }
             },
             "required": ["task_description", "completed_steps"]
@@ -145,10 +165,7 @@ impl ServerHandler for XunServer {
             tools.push(Tool {
                 name: Cow::Borrowed("check"),
                 description: Cow::Borrowed(
-                    "【建议】任务完成前调用，传入已完成步骤 ID 列表，检查是否遗漏建议步骤。返回：\
-                    passed（是否通过）、missing_steps（遗漏步骤列表，含 id/name/action）、\
-                    completed_steps（已完成列表回显）、loop_info（循环回退信息）、\
-                    message（检查结果摘要）、progress_display（带完成状态的 Markdown 进度清单）。"
+                    "任务完成前调用。尽量回传 hint 的 suggested_steps、workflow_fingerprint、hint_fingerprint。返回 status、passed、should_rehint、missing_steps、diagnostics。"
                 ),
                 input_schema: Arc::new(schema_map),
             });
@@ -189,7 +206,7 @@ impl ServerHandler for XunServer {
                     hint_request.complexity.as_deref(),
                 );
 
-                let result_json = match serde_json::to_string_pretty(&result) {
+                let result_json = match serde_json::to_string(&result) {
                     Ok(json) => json,
                     Err(e) => {
                         let msg = format!("hint 结果序列化失败: {}", e);
@@ -198,7 +215,7 @@ impl ServerHandler for XunServer {
                     }
                 };
 
-                log::info!(
+                log::debug!(
                     "hint: task=\"{}\" → complexity={}",
                     hint_request.task_description,
                     result.complexity
@@ -223,9 +240,12 @@ impl ServerHandler for XunServer {
                     &check_request.task_description,
                     check_request.complexity.as_deref(),
                     &check_request.completed_steps,
+                    Some(&check_request.expected_steps),
+                    check_request.workflow_fingerprint.as_deref(),
+                    check_request.hint_fingerprint.as_deref(),
                 );
 
-                let result_json = match serde_json::to_string_pretty(&result) {
+                let result_json = match serde_json::to_string(&result) {
                     Ok(json) => json,
                     Err(e) => {
                         let msg = format!("check 结果序列化失败: {}", e);
@@ -234,8 +254,9 @@ impl ServerHandler for XunServer {
                     }
                 };
 
-                log::info!(
-                    "check: passed={}, missing={}",
+                log::debug!(
+                    "check: status={:?}, passed={}, missing={}",
+                    result.status,
                     result.passed,
                     result.missing_steps.len()
                 );
@@ -253,7 +274,7 @@ impl ServerHandler for XunServer {
 
 pub async fn run_workflow_server() -> Result<(), Box<dyn std::error::Error>> {
     let server = XunServer::new();
-    log::info!("XunServer 初始化完成，准备启动 stdio 传输");
+    log::debug!("XunServer 初始化完成，准备启动 stdio 传输");
 
     let service = server
         .serve(stdio())
@@ -262,8 +283,8 @@ pub async fn run_workflow_server() -> Result<(), Box<dyn std::error::Error>> {
             log::error!("启动循(Xun) MCP 服务器失败: {}", e);
         })?;
 
-    log::info!("MCP stdio 传输已建立，等待请求...");
+    log::debug!("MCP stdio 传输已建立，等待请求...");
     service.waiting().await?;
-    log::info!("MCP 服务器正常退出");
+    log::debug!("MCP 服务器正常退出");
     Ok(())
 }

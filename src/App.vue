@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { computed, ref, onMounted, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
 
@@ -29,6 +29,20 @@ interface WorkflowPreset {
   workflow: WorkflowDefinition;
 }
 
+interface WorkflowValidationIssue {
+  code: string;
+  severity: 'error' | 'warning';
+  node_id?: string | null;
+  message: string;
+}
+
+interface WorkflowConfigMetadata {
+  workflow_fingerprint: string;
+  config_path?: string | null;
+  has_errors: boolean;
+  issues: WorkflowValidationIssue[];
+}
+
 const config = ref<WorkflowDefinition>({
   nodes: [],
   complexity_rules: {},
@@ -43,6 +57,11 @@ function nodeKey(node: object): number {
 }
 
 const presets = ref<WorkflowPreset[]>([]);
+const workflowMetadata = ref<WorkflowConfigMetadata | null>(null);
+const isMetadataLoading = ref(false);
+const hasBlockingIssues = computed(() => workflowMetadata.value?.has_errors ?? false);
+let metadataRefreshTimer: number | null = null;
+let lastMetadataConfigKey = "";
 
 const isSaving = ref(false);
 const isLoading = ref(false);
@@ -59,6 +78,41 @@ function notify(msg: string, duration = 3000) {
     }, duration);
   }
 }
+
+async function refreshWorkflowMetadata(options: { silent?: boolean } = {}) {
+  const configKey = JSON.stringify(config.value);
+  if (options.silent && workflowMetadata.value && configKey === lastMetadataConfigKey) {
+    return;
+  }
+
+  isMetadataLoading.value = true;
+  try {
+    workflowMetadata.value = await invoke<WorkflowConfigMetadata>("inspect_workflow_config", {
+      config: config.value,
+    });
+    lastMetadataConfigKey = configKey;
+  } catch (e) {
+    workflowMetadata.value = null;
+    if (!options.silent) {
+      notify(`配置元信息刷新失败: ${e}`);
+    }
+  } finally {
+    isMetadataLoading.value = false;
+  }
+}
+
+function scheduleMetadataRefresh() {
+  if (metadataRefreshTimer !== null) {
+    window.clearTimeout(metadataRefreshTimer);
+  }
+  metadataRefreshTimer = window.setTimeout(() => {
+    void refreshWorkflowMetadata({ silent: true });
+  }, 200);
+}
+
+watch(config, () => {
+  scheduleMetadataRefresh();
+}, { deep: true });
 
 // 模态框态
 const showPresetModal = ref(false);
@@ -177,15 +231,20 @@ const mcpUsagePrompt = `## Xun Workflow MCP 使用指南
 然后在 \`.vscode/\` 或用户级 prompts 中添加以下规则：
 
 ### 核心规则（复制到你的 instructions 文件中）
-1. 每个任务开始前，必须调用 \`mcp_workFlow_hint\` 获取工作流建议
-2. 按返回的 \`suggested_steps\` 逐步执行
-3. 任务完成前，可调用 \`mcp_workFlow_check\` 自检
-4. 代码完成后调用寸止(zhi)工具获取用户反馈，循环到用户说「结束」
+1. 新会话或刚重启后，先确认当前工具列表里已经出现 \`mcp_workFlow_hint\` 和 \`mcp_workFlow_check\`；未出现时先等待 MCP 注册完成，不要按名字直接调用
+2. 每个任务开始前，必须调用 \`mcp_workFlow_hint\` 获取工作流建议
+3. 按返回的 \`suggested_steps\` 逐步执行
+4. 任务完成前，可调用 \`mcp_workFlow_check\` 自检；若返回 \`should_rehint=true\`，必须重新调用 hint
+5. 代码完成后调用寸止(zhi)工具获取用户反馈，循环到用户说「结束」
 
 ### hint 返回字段说明
 | 字段 | 说明 |
 |------|------|
+| contract_version | 协议版本，当前为 2 |
 | complexity | 任务复杂度（simple/medium/complex），决定执行深度 |
+| workflow_fingerprint | 当前 workflow.yaml 指纹，供 check 检测配置漂移 |
+| hint_fingerprint | 当前 hint 快照指纹，供 check 校验同一轮契约 |
+| expected_step_ids | 本轮 hint 实际展开出的步骤 ID 列表 |
 | suggested_steps | 建议步骤列表（按序执行），每项含 id、name、action、skip_conditions |
 | skipped_steps | 已跳过的步骤及原因（无需执行） |
 | loop_info | 循环回退信息：loop_node_id（触发节点）、loop_back_to（回退目标）、re_execute_nodes（重执行列表），为 null 表示无循环 |
@@ -195,10 +254,13 @@ const mcpUsagePrompt = `## Xun Workflow MCP 使用指南
 ### check 返回字段说明
 | 字段 | 说明 |
 |------|------|
-| passed | 是否通过（true=所有建议步骤已完成） |
+| status | ok / missing_steps / stale_config / invalid_hint_snapshot |
+| passed | 是否通过（只有 status=ok 时为 true） |
+| should_rehint | 是否必须重新调用 hint |
 | missing_steps | 遗漏的步骤列表（含 id、name、action） |
-| completed_steps | 已完成步骤 ID 列表（传入参数回显） |
-| loop_info | 与 hint 相同的循环回退信息 |
+| unknown_completed_steps | 不属于本轮 hint 快照的 completed_steps |
+| duplicate_completed_steps | 重复上报的 completed_steps |
+| diagnostics | 漂移或输入异常的诊断信息 |
 | message | 检查结果文字摘要 |
 | progress_display | 带完成状态的 Markdown 进度清单 |`;
 
@@ -334,6 +396,7 @@ onMounted(async () => {
     if (config.value.nodes.length > 0) {
       selectedNodeIndex.value = 0;
     }
+    await refreshWorkflowMetadata({ silent: true });
   } catch (e) {
     notify(`加载失败: ${e}`);
   }
@@ -351,6 +414,7 @@ async function saveConfig() {
   } catch (e) {
     notify(`保存失败: ${e}`);
   } finally {
+    await refreshWorkflowMetadata({ silent: true });
     isSaving.value = false;
   }
 }
@@ -686,7 +750,7 @@ function onDragEnd() {
 
           <!-- 收藏为预设 -->
           <div class="relative group shrink-0">
-            <button @click="openPresetModal" class="hover:bg-white dark:hover:bg-neutral-700 text-amber-600 dark:text-amber-400 px-3 py-1.5 rounded-md font-medium text-sm transition-all active:scale-95 flex items-center gap-1.5 whitespace-nowrap">
+            <button @click="openPresetModal" :disabled="hasBlockingIssues" class="hover:bg-white dark:hover:bg-neutral-700 text-amber-600 dark:text-amber-400 px-3 py-1.5 rounded-md font-medium text-sm transition-all active:scale-95 flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:pointer-events-none">
               <!-- 星星收藏图标 -->
               <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z"></path></svg>
               <span class="hidden lg:inline">存为预设</span>
@@ -704,7 +768,7 @@ function onDragEnd() {
             leave-to-class="opacity-0 scale-95"
           >
           <div v-if="activePresetName" class="relative group shrink-0">
-            <button @click="updateActivePreset" :disabled="isLoading" class="hover:bg-white dark:hover:bg-neutral-700 text-cyan-600 dark:text-cyan-400 px-3 py-1.5 rounded-md font-medium text-sm transition-all active:scale-95 flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:pointer-events-none">
+            <button @click="updateActivePreset" :disabled="isLoading || hasBlockingIssues" class="hover:bg-white dark:hover:bg-neutral-700 text-cyan-600 dark:text-cyan-400 px-3 py-1.5 rounded-md font-medium text-sm transition-all active:scale-95 flex items-center gap-1.5 whitespace-nowrap disabled:opacity-50 disabled:pointer-events-none">
               <svg :class="isLoading ? 'animate-spin' : ''" class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
               <span class="hidden lg:inline">{{ isLoading ? '处理中...' : '更新预设' }}</span>
             </button>
@@ -815,18 +879,63 @@ function onDragEnd() {
         </div>
 
         <div class="relative group shrink-0">
-          <button @click="saveConfig" :disabled="isSaving" class="bg-primary-600 hover:bg-primary-500 disabled:opacity-50 text-white px-4 lg:px-5 py-2 rounded-md font-medium text-sm transition-all active:scale-95 focus:ring-2 focus:ring-primary-500/50 shadow-lg shadow-primary-600/20 flex items-center gap-1.5 shrink-0 whitespace-nowrap">
+          <button @click="saveConfig" :disabled="isSaving || hasBlockingIssues" class="bg-primary-600 hover:bg-primary-500 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 lg:px-5 py-2 rounded-md font-medium text-sm transition-all active:scale-95 focus:ring-2 focus:ring-primary-500/50 shadow-lg shadow-primary-600/20 flex items-center gap-1.5 shrink-0 whitespace-nowrap">
             <svg v-if="isSaving" class="w-4 h-4 shrink-0 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
             <svg v-else class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
             <span class="hidden md:inline">{{ isSaving ? '保存中...' : '应用' }}</span>
           </button>
           <div class="absolute top-[calc(100%+0.5rem)] right-0 px-2.5 py-1.5 bg-neutral-800 text-neutral-200 text-xs rounded-md shadow-lg border border-neutral-700 opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap pointer-events-none z-[60]">
-            应用当前配置到工作流
+            {{ hasBlockingIssues ? '存在配置错误，修复后才能应用' : '应用当前配置到工作流' }}
           </div>
         </div>
       </div>
       </div>
     </header>
+
+    <section class="shrink-0 border-b border-neutral-200 dark:border-neutral-800 bg-white/80 dark:bg-neutral-900/40 backdrop-blur-sm px-6 py-3">
+      <div class="flex flex-wrap items-center gap-2.5 text-xs">
+        <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full border"
+             :class="workflowMetadata?.has_errors ? 'bg-red-50 dark:bg-red-500/10 border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400' : 'bg-emerald-50 dark:bg-emerald-500/10 border-emerald-200 dark:border-emerald-500/20 text-emerald-600 dark:text-emerald-400'">
+          <span class="w-1.5 h-1.5 rounded-full" :class="workflowMetadata?.has_errors ? 'bg-red-500' : 'bg-emerald-500'"></span>
+          <span>{{ workflowMetadata?.has_errors ? '配置校验未通过' : '配置校验通过' }}</span>
+        </div>
+
+        <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-neutral-100 dark:bg-neutral-800/80 border border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-300">
+          <span class="text-neutral-400 dark:text-neutral-500 uppercase tracking-wide">Fingerprint</span>
+          <span class="font-mono text-[11px]">{{ workflowMetadata?.workflow_fingerprint?.slice(0, 12) || '加载中' }}<template v-if="workflowMetadata?.workflow_fingerprint">...</template></span>
+        </div>
+
+        <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-neutral-100 dark:bg-neutral-800/80 border border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-300 max-w-full">
+          <span class="text-neutral-400 dark:text-neutral-500 uppercase tracking-wide">Path</span>
+          <span class="font-mono text-[11px] truncate max-w-[32rem]" :title="workflowMetadata?.config_path || ''">{{ workflowMetadata?.config_path || '未确定' }}</span>
+        </div>
+
+        <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-neutral-100 dark:bg-neutral-800/80 border border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-300">
+          <span class="text-neutral-400 dark:text-neutral-500 uppercase tracking-wide">Issues</span>
+          <span class="font-semibold">{{ workflowMetadata?.issues.length ?? 0 }}</span>
+        </div>
+
+        <div v-if="isMetadataLoading" class="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-blue-50 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/20 text-blue-600 dark:text-blue-400">
+          <svg class="w-3.5 h-3.5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+          <span>正在刷新配置元信息</span>
+        </div>
+      </div>
+
+      <div v-if="workflowMetadata?.issues.length" class="mt-3 grid gap-2">
+        <div v-for="issue in workflowMetadata.issues" :key="`${issue.code}-${issue.node_id || 'global'}-${issue.message}`" class="rounded-xl border px-4 py-3"
+             :class="issue.severity === 'error' ? 'bg-red-50 dark:bg-red-500/10 border-red-200 dark:border-red-500/20' : 'bg-amber-50 dark:bg-amber-500/10 border-amber-200 dark:border-amber-500/20'">
+          <div class="flex flex-wrap items-center gap-2 text-[11px] mb-1.5">
+            <span class="px-2 py-0.5 rounded-full font-semibold border"
+                  :class="issue.severity === 'error' ? 'text-red-600 dark:text-red-400 border-red-200 dark:border-red-500/20 bg-white/70 dark:bg-transparent' : 'text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/20 bg-white/70 dark:bg-transparent'">
+              {{ issue.severity === 'error' ? '错误' : '警告' }}
+            </span>
+            <span v-if="issue.node_id" class="font-mono text-neutral-500 dark:text-neutral-400">节点 {{ issue.node_id }}</span>
+            <span class="font-mono text-neutral-400 dark:text-neutral-500">{{ issue.code }}</span>
+          </div>
+          <p class="text-sm leading-relaxed text-neutral-700 dark:text-neutral-200">{{ issue.message }}</p>
+        </div>
+      </div>
+    </section>
 
     <div class="flex flex-1 overflow-hidden">
       <!-- 侧边栏: 画布树状图 -->
@@ -1027,7 +1136,7 @@ function onDragEnd() {
         </div>
         <div class="p-4 bg-neutral-50 dark:bg-neutral-950 border-t border-neutral-200 dark:border-neutral-800 flex justify-end gap-3 rounded-b-2xl">
           <button @click="showPresetModal = false" class="px-5 py-2 text-sm font-medium text-neutral-600 dark:text-neutral-400 hover:text-white transition-colors bg-white dark:bg-neutral-900 hover:bg-neutral-100 dark:bg-neutral-800 rounded-md border border-neutral-200 dark:border-neutral-800">取消</button>
-          <button @click="confirmSavePreset" :disabled="!newPresetName.trim()" class="bg-primary-600 hover:bg-primary-500 disabled:opacity-50 text-white px-6 py-2 rounded-md font-medium text-sm transition-all shadow-lg focus:outline-none focus:ring-2 focus:ring-primary-500/50">确认保存</button>
+          <button @click="confirmSavePreset" :disabled="!newPresetName.trim() || hasBlockingIssues" class="bg-primary-600 hover:bg-primary-500 disabled:opacity-50 disabled:cursor-not-allowed text-white px-6 py-2 rounded-md font-medium text-sm transition-all shadow-lg focus:outline-none focus:ring-2 focus:ring-primary-500/50">确认保存</button>
         </div>
       </div>
     </div>

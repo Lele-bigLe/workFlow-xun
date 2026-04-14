@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub const WORKFLOW_CONTRACT_VERSION: u32 = 2;
+
 /// 工作流节点定义
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowNode {
@@ -63,8 +65,37 @@ pub struct WorkflowDefinition {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowValidationSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowValidationIssue {
+    pub code: String,
+    pub severity: WorkflowValidationSeverity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowConfigMetadata {
+    pub workflow_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
+    pub has_errors: bool,
+    pub issues: Vec<WorkflowValidationIssue>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkflowHintResult {
+    pub contract_version: u32,
     pub complexity: String,
+    pub workflow_fingerprint: String,
+    pub hint_fingerprint: String,
+    pub expected_step_ids: Vec<String>,
     pub suggested_steps: Vec<SuggestedStep>,
     pub skipped_steps: Vec<SkippedStep>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,12 +115,12 @@ pub struct LoopInfo {
     pub re_execute_nodes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SuggestedStep {
     pub id: String,
     pub name: String,
     pub action: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skip_conditions: Vec<String>,
 }
 
@@ -100,10 +131,33 @@ pub struct SkippedStep {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Ok,
+    MissingSteps,
+    StaleConfig,
+    InvalidHintSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkflowCheckResult {
+    pub contract_version: u32,
+    pub status: CheckStatus,
     pub passed: bool,
+    pub should_rehint: bool,
     pub missing_steps: Vec<MissingStep>,
+    pub missing_required_steps: Vec<MissingStep>,
     pub completed_steps: Vec<String>,
+    pub normalized_completed_steps: Vec<String>,
+    pub unknown_completed_steps: Vec<String>,
+    pub duplicate_completed_steps: Vec<String>,
+    pub expected_step_ids: Vec<String>,
+    pub current_workflow_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provided_workflow_fingerprint: Option<String>,
+    pub hint_fingerprint: String,
+    pub completion_rate: f32,
+    pub diagnostics: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub loop_info: Option<LoopInfo>,
     pub message: String,

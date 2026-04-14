@@ -2,6 +2,8 @@
 // 根据任务描述评估复杂度，生成工作流建议路径
 
 use super::definition::*;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 
 pub fn evaluate_workflow(
     definition: &WorkflowDefinition,
@@ -46,12 +48,25 @@ pub fn evaluate_workflow(
     let reminder = build_reminder(&complexity);
 
     let progress_display = build_progress_display(&suggested_steps, &[]);
+    let expected_step_ids: Vec<String> = suggested_steps.iter().map(|step| step.id.clone()).collect();
+    let workflow_fingerprint = build_workflow_fingerprint(definition);
+    let complexity_text = complexity.to_string();
+    let hint_fingerprint = build_hint_fingerprint(
+        task_description,
+        &complexity_text,
+        &expected_step_ids,
+        &workflow_fingerprint,
+    );
 
     // 构建循环回退信息
     let loop_info = build_loop_info(&definition.nodes, &suggested_steps);
 
     WorkflowHintResult {
-        complexity: complexity.to_string(),
+        contract_version: WORKFLOW_CONTRACT_VERSION,
+        complexity: complexity_text,
+        workflow_fingerprint,
+        hint_fingerprint,
+        expected_step_ids,
         suggested_steps,
         skipped_steps,
         loop_info,
@@ -202,37 +217,165 @@ pub fn check_workflow(
     task_description: &str,
     hint_complexity: Option<&str>,
     completed_steps: &[String],
+    expected_steps: Option<&[SuggestedStep]>,
+    workflow_fingerprint: Option<&str>,
+    hint_fingerprint: Option<&str>,
 ) -> WorkflowCheckResult {
-    let hint = evaluate_workflow(definition, task_description, hint_complexity);
+    let live_hint = evaluate_workflow(definition, task_description, hint_complexity);
+    let current_workflow_fingerprint = live_hint.workflow_fingerprint.clone();
+    let provided_workflow_fingerprint = workflow_fingerprint.map(str::to_string);
+    let snapshot_steps = match expected_steps {
+        Some(steps) if !steps.is_empty() => steps.to_vec(),
+        _ => live_hint.suggested_steps.clone(),
+    };
+    let expected_step_ids: Vec<String> = snapshot_steps.iter().map(|step| step.id.clone()).collect();
+    let fingerprint_complexity = hint_complexity.unwrap_or(live_hint.complexity.as_str());
+    let effective_workflow_fingerprint = workflow_fingerprint.unwrap_or(current_workflow_fingerprint.as_str());
+    let computed_hint_fingerprint = build_hint_fingerprint(
+        task_description,
+        fingerprint_complexity,
+        &expected_step_ids,
+        effective_workflow_fingerprint,
+    );
+    let (normalized_completed_steps, duplicate_completed_steps) = normalize_completed_steps(completed_steps);
+    let unknown_completed_steps = collect_unknown_completed_steps(&normalized_completed_steps, &expected_step_ids);
+    let missing_steps = collect_missing_steps(&snapshot_steps, &normalized_completed_steps);
+    let completion_rate = build_completion_rate(snapshot_steps.len(), missing_steps.len());
+    let progress_display = build_progress_display(&snapshot_steps, &normalized_completed_steps);
 
-    let mut missing_steps = Vec::new();
+    let mut diagnostics = Vec::new();
+    if !duplicate_completed_steps.is_empty() {
+        diagnostics.push(format!(
+            "检测到重复 completed_steps: {}",
+            duplicate_completed_steps.join("、")
+        ));
+    }
+    if !unknown_completed_steps.is_empty() {
+        diagnostics.push(format!(
+            "检测到未出现在 hint 快照中的步骤: {}",
+            unknown_completed_steps.join("、")
+        ));
+    }
 
-    for step in &hint.suggested_steps {
-        if !completed_steps.iter().any(|c| c == &step.id) {
-            missing_steps.push(MissingStep {
-                id: step.id.clone(),
-                name: step.name.clone(),
-                action: step.action.clone(),
-            });
+    if let Some(provided_fingerprint) = workflow_fingerprint {
+        if provided_fingerprint != current_workflow_fingerprint {
+            diagnostics.push("当前 workflow.yaml 已变化，本次 check 不能继续沿用旧 hint 快照".to_string());
+            return WorkflowCheckResult {
+                contract_version: WORKFLOW_CONTRACT_VERSION,
+                status: CheckStatus::StaleConfig,
+                passed: false,
+                should_rehint: true,
+                missing_steps,
+                missing_required_steps: Vec::new(),
+                completed_steps: completed_steps.to_vec(),
+                normalized_completed_steps,
+                unknown_completed_steps,
+                duplicate_completed_steps,
+                expected_step_ids,
+                current_workflow_fingerprint,
+                provided_workflow_fingerprint,
+                hint_fingerprint: computed_hint_fingerprint,
+                completion_rate,
+                diagnostics,
+                loop_info: None,
+                message: "⚠️ 当前工作流配置已变化，请重新调用 hint 获取新的步骤快照".to_string(),
+                progress_display: progress_display.clone(),
+            };
         }
     }
 
-    let passed = missing_steps.is_empty();
+    let expected_matches_live = expected_steps
+        .filter(|steps| !steps.is_empty())
+        .map(|_| live_hint.expected_step_ids == expected_step_ids)
+        .unwrap_or(true);
 
-    let message = if passed {
-        "✅ 所有建议步骤已完成，工作流执行正确".to_string()
+    if let Some(provided_hint_fingerprint) = hint_fingerprint {
+        if provided_hint_fingerprint != computed_hint_fingerprint {
+            diagnostics.push("hint_fingerprint 与当前 check 输入不匹配，hint 快照可能已损坏或字段未同步".to_string());
+            return WorkflowCheckResult {
+                contract_version: WORKFLOW_CONTRACT_VERSION,
+                status: CheckStatus::InvalidHintSnapshot,
+                passed: false,
+                should_rehint: true,
+                missing_steps,
+                missing_required_steps: Vec::new(),
+                completed_steps: completed_steps.to_vec(),
+                normalized_completed_steps,
+                unknown_completed_steps,
+                duplicate_completed_steps,
+                expected_step_ids,
+                current_workflow_fingerprint,
+                provided_workflow_fingerprint,
+                hint_fingerprint: computed_hint_fingerprint,
+                completion_rate,
+                diagnostics,
+                loop_info: None,
+                message: "⚠️ hint 快照校验失败，请重新调用 hint 后再执行 check".to_string(),
+                progress_display: progress_display.clone(),
+            };
+        }
+    } else if !expected_matches_live {
+        diagnostics.push("expected_steps 与当前 hint 展开结果不一致，且未提供 hint_fingerprint 作为快照校验锚点".to_string());
+        return WorkflowCheckResult {
+            contract_version: WORKFLOW_CONTRACT_VERSION,
+            status: CheckStatus::InvalidHintSnapshot,
+            passed: false,
+            should_rehint: true,
+            missing_steps,
+            missing_required_steps: Vec::new(),
+            completed_steps: completed_steps.to_vec(),
+            normalized_completed_steps,
+            unknown_completed_steps,
+            duplicate_completed_steps,
+            expected_step_ids,
+            current_workflow_fingerprint,
+            provided_workflow_fingerprint,
+            hint_fingerprint: computed_hint_fingerprint,
+            completion_rate,
+            diagnostics,
+            loop_info: None,
+            message: "⚠️ hint 快照不完整或已漂移，请重新调用 hint 获取稳定锚点".to_string(),
+            progress_display: progress_display.clone(),
+        };
+    }
+
+    let missing_required_steps = collect_missing_required_steps(definition, &missing_steps);
+    let status = if missing_steps.is_empty() {
+        CheckStatus::Ok
     } else {
-        let names: Vec<&str> = missing_steps.iter().map(|s| s.name.as_str()).collect();
+        CheckStatus::MissingSteps
+    };
+    let passed = matches!(status, CheckStatus::Ok);
+    let message = if passed {
+        "✅ hint 快照中的所有建议步骤已完成，工作流执行正确".to_string()
+    } else {
+        let names: Vec<&str> = missing_steps.iter().map(|step| step.name.as_str()).collect();
         format!("⚠️ 以下步骤尚未完成: {}", names.join("、"))
     };
-
-    let progress_display = build_progress_display(&hint.suggested_steps, completed_steps);
+    let loop_info = if live_hint.expected_step_ids == expected_step_ids {
+        live_hint.loop_info
+    } else {
+        None
+    };
 
     WorkflowCheckResult {
+        contract_version: WORKFLOW_CONTRACT_VERSION,
+        status,
         passed,
+        should_rehint: false,
         missing_steps,
+        missing_required_steps,
         completed_steps: completed_steps.to_vec(),
-        loop_info: hint.loop_info,
+        normalized_completed_steps: normalized_completed_steps.clone(),
+        unknown_completed_steps,
+        duplicate_completed_steps,
+        expected_step_ids,
+        current_workflow_fingerprint,
+        provided_workflow_fingerprint,
+        hint_fingerprint: computed_hint_fingerprint,
+        completion_rate,
+        diagnostics,
+        loop_info,
         message,
         progress_display,
     }
@@ -246,4 +389,117 @@ fn build_progress_display(steps: &[SuggestedStep], completed: &[String]) -> Stri
         lines.push(format!("{} {}", checkbox, step.name));
     }
     lines.join("\n")
+}
+
+fn collect_missing_steps(steps: &[SuggestedStep], completed: &[String]) -> Vec<MissingStep> {
+    steps.iter()
+        .filter(|step| !completed.iter().any(|done| done == &step.id))
+        .map(|step| MissingStep {
+            id: step.id.clone(),
+            name: step.name.clone(),
+            action: step.action.clone(),
+        })
+        .collect()
+}
+
+fn collect_missing_required_steps(
+    definition: &WorkflowDefinition,
+    missing_steps: &[MissingStep],
+) -> Vec<MissingStep> {
+    missing_steps.iter()
+        .filter(|step| {
+            definition.nodes.iter().any(|node| node.id == step.id && node.required)
+        })
+        .cloned()
+        .collect()
+}
+
+fn collect_unknown_completed_steps(completed: &[String], expected_step_ids: &[String]) -> Vec<String> {
+    let expected: HashSet<&str> = expected_step_ids.iter().map(String::as_str).collect();
+    completed.iter()
+        .filter(|step_id| !expected.contains(step_id.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn normalize_completed_steps(completed_steps: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut seen = HashSet::new();
+    let mut duplicate_seen = HashSet::new();
+    let mut normalized = Vec::new();
+    let mut duplicates = Vec::new();
+
+    for step in completed_steps {
+        let normalized_step = step.trim();
+        if normalized_step.is_empty() {
+            continue;
+        }
+
+        if seen.insert(normalized_step.to_string()) {
+            normalized.push(normalized_step.to_string());
+        } else if duplicate_seen.insert(normalized_step.to_string()) {
+            duplicates.push(normalized_step.to_string());
+        }
+    }
+
+    (normalized, duplicates)
+}
+
+fn build_completion_rate(total_steps: usize, missing_steps: usize) -> f32 {
+    if total_steps == 0 {
+        return 1.0;
+    }
+
+    (total_steps.saturating_sub(missing_steps) as f32) / total_steps as f32
+}
+
+pub fn build_workflow_fingerprint(definition: &WorkflowDefinition) -> String {
+    let mut lines = Vec::new();
+
+    for node in &definition.nodes {
+        lines.push(format!(
+            "node|{}|{}|{}|{}|{}|{}",
+            node.id,
+            node.name,
+            node.required,
+            node.action,
+            node.loop_back_to.as_deref().unwrap_or(""),
+            node.skip_when.join("\u{001f}")
+        ));
+    }
+
+    let mut rules: Vec<_> = definition.complexity_rules.iter().collect();
+    rules.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (level, rule) in rules {
+        lines.push(format!(
+            "rule|{}|{}|{}",
+            level,
+            rule.max_files.map(|value| value.to_string()).unwrap_or_default(),
+            rule.nature.join("\u{001f}")
+        ));
+    }
+
+    hash_text(&lines.join("\n"))
+}
+
+fn build_hint_fingerprint(
+    task_description: &str,
+    complexity: &str,
+    expected_step_ids: &[String],
+    workflow_fingerprint: &str,
+) -> String {
+    let mut lines = vec![
+        normalize_task_description(task_description),
+        complexity.trim().to_lowercase(),
+        workflow_fingerprint.to_string(),
+    ];
+    lines.extend(expected_step_ids.iter().cloned());
+    hash_text(&lines.join("\n"))
+}
+
+fn normalize_task_description(task_description: &str) -> String {
+    task_description.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn hash_text(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }

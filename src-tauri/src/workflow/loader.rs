@@ -2,10 +2,32 @@
 // 支持从 ~/.xun/workflow.yaml 加载自定义配置
 
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
-use super::definition::WorkflowDefinition;
+use super::definition::{
+    WorkflowConfigMetadata, WorkflowDefinition, WorkflowValidationIssue,
+    WorkflowValidationSeverity,
+};
 use super::default::default_workflow;
+
+#[derive(Clone)]
+struct WorkflowCacheEntry {
+    path_key: Option<String>,
+    modified_at: Option<SystemTime>,
+    definition: WorkflowDefinition,
+}
+
+fn workflow_cache() -> &'static Mutex<Option<WorkflowCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<WorkflowCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn workflow_modified_at(path: &PathBuf) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
 
 /// 用户设置（存储在固定位置 ~/.xun/settings.yaml）
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -65,7 +87,19 @@ pub fn set_data_dir(dir: &str) -> std::result::Result<(), String> {
 }
 
 pub fn load_workflow_definition() -> WorkflowDefinition {
-    match try_load_custom_workflow() {
+    let config_path = get_workflow_config_path();
+    let path_key = config_path.as_ref().map(|path| path.to_string_lossy().to_string());
+    let modified_at = config_path.as_ref().and_then(workflow_modified_at);
+
+    if let Ok(cache) = workflow_cache().lock() {
+        if let Some(entry) = cache.as_ref() {
+            if entry.path_key == path_key && entry.modified_at == modified_at {
+                return entry.definition.clone();
+            }
+        }
+    }
+
+    let definition = match try_load_custom_workflow() {
         Ok(Some(def)) => {
             log::info!("已加载自定义工作流配置");
             def
@@ -78,7 +112,17 @@ pub fn load_workflow_definition() -> WorkflowDefinition {
             log::warn!("加载自定义工作流配置失败: {}，使用内置默认值", e);
             default_workflow()
         }
+    };
+
+    if let Ok(mut cache) = workflow_cache().lock() {
+        *cache = Some(WorkflowCacheEntry {
+            path_key,
+            modified_at,
+            definition: definition.clone(),
+        });
     }
+
+    definition
 }
 
 pub fn get_workflow_config_path() -> Option<PathBuf> {
@@ -126,11 +170,131 @@ fn try_load_custom_workflow() -> Result<Option<WorkflowDefinition>> {
     let content = std::fs::read_to_string(&config_path)?;
     let definition: WorkflowDefinition = serde_yaml::from_str(&content)?;
 
-    if definition.nodes.is_empty() {
-        anyhow::bail!("workflow.yaml 中节点列表为空");
+    let issues = validate_workflow_definition(&definition);
+    let blocking_issues: Vec<&WorkflowValidationIssue> = issues.iter()
+        .filter(|issue| matches!(issue.severity, WorkflowValidationSeverity::Error))
+        .collect();
+    if !blocking_issues.is_empty() {
+        let messages: Vec<&str> = blocking_issues.iter().map(|issue| issue.message.as_str()).collect();
+        anyhow::bail!("workflow.yaml 配置校验失败: {}", messages.join("；"));
     }
 
     Ok(Some(definition))
+}
+
+pub fn validate_workflow_definition(definition: &WorkflowDefinition) -> Vec<WorkflowValidationIssue> {
+    let mut issues = Vec::new();
+
+    if definition.nodes.is_empty() {
+        issues.push(WorkflowValidationIssue {
+            code: "workflow_empty".to_string(),
+            severity: WorkflowValidationSeverity::Error,
+            node_id: None,
+            message: "workflow.yaml 中节点列表为空".to_string(),
+        });
+        return issues;
+    }
+
+    let mut seen_ids = HashSet::new();
+    let mut duplicate_ids = HashSet::new();
+    let mut valid_node_ids = HashSet::new();
+
+    for node in &definition.nodes {
+        let node_id = node.id.trim();
+
+        if node_id.is_empty() {
+            issues.push(WorkflowValidationIssue {
+                code: "empty_node_id".to_string(),
+                severity: WorkflowValidationSeverity::Error,
+                node_id: None,
+                message: format!("节点「{}」缺少 id", node.name),
+            });
+        } else if !seen_ids.insert(node_id.to_string()) {
+            duplicate_ids.insert(node_id.to_string());
+        } else {
+            valid_node_ids.insert(node_id.to_string());
+        }
+
+        if node.name.trim().is_empty() {
+            issues.push(WorkflowValidationIssue {
+                code: "empty_node_name".to_string(),
+                severity: WorkflowValidationSeverity::Error,
+                node_id: (!node_id.is_empty()).then(|| node_id.to_string()),
+                message: format!("节点 id={} 缺少 name", if node_id.is_empty() { "<empty>" } else { node_id }),
+            });
+        }
+
+        if node.required && !node.skip_when.is_empty() {
+            issues.push(WorkflowValidationIssue {
+                code: "required_node_has_skip_when".to_string(),
+                severity: WorkflowValidationSeverity::Warning,
+                node_id: (!node_id.is_empty()).then(|| node_id.to_string()),
+                message: format!("节点「{}」被标记为 required，skip_when 将被运行时忽略", node.name),
+            });
+        }
+    }
+
+    let mut duplicate_ids: Vec<String> = duplicate_ids.into_iter().collect();
+    duplicate_ids.sort();
+    for duplicate_id in duplicate_ids {
+        issues.push(WorkflowValidationIssue {
+            code: "duplicate_node_id".to_string(),
+            severity: WorkflowValidationSeverity::Error,
+            node_id: Some(duplicate_id.clone()),
+            message: format!("节点 id「{}」重复，check/hint 无法稳定追踪步骤", duplicate_id),
+        });
+    }
+
+    for node in &definition.nodes {
+        let node_id = node.id.trim();
+        if let Some(target) = node.loop_back_to.as_deref() {
+            let target = target.trim();
+            if target.is_empty() {
+                issues.push(WorkflowValidationIssue {
+                    code: "empty_loop_back_to".to_string(),
+                    severity: WorkflowValidationSeverity::Error,
+                    node_id: (!node_id.is_empty()).then(|| node_id.to_string()),
+                    message: format!("节点「{}」配置了空的 loop_back_to", node.name),
+                });
+            } else if !valid_node_ids.contains(target) {
+                issues.push(WorkflowValidationIssue {
+                    code: "invalid_loop_back_to".to_string(),
+                    severity: WorkflowValidationSeverity::Error,
+                    node_id: (!node_id.is_empty()).then(|| node_id.to_string()),
+                    message: format!("节点「{}」的 loop_back_to 指向不存在的节点 id「{}」", node.name, target),
+                });
+            }
+        }
+    }
+
+    issues
+}
+
+pub fn build_workflow_config_metadata(definition: &WorkflowDefinition) -> WorkflowConfigMetadata {
+    let issues = validate_workflow_definition(definition);
+    let has_errors = issues.iter()
+        .any(|issue| matches!(issue.severity, WorkflowValidationSeverity::Error));
+
+    WorkflowConfigMetadata {
+        workflow_fingerprint: super::engine::build_workflow_fingerprint(definition),
+        config_path: get_workflow_config_path().map(|path| path.to_string_lossy().to_string()),
+        has_errors,
+        issues,
+    }
+}
+
+pub fn ensure_valid_workflow_definition(definition: &WorkflowDefinition) -> Result<(), String> {
+    let issues = validate_workflow_definition(definition);
+    let blocking_issues: Vec<&WorkflowValidationIssue> = issues.iter()
+        .filter(|issue| matches!(issue.severity, WorkflowValidationSeverity::Error))
+        .collect();
+
+    if blocking_issues.is_empty() {
+        return Ok(());
+    }
+
+    let messages: Vec<&str> = blocking_issues.iter().map(|issue| issue.message.as_str()).collect();
+    Err(format!("配置校验失败: {}", messages.join("；")))
 }
 
 pub fn generate_workflow_rules_text(definition: &WorkflowDefinition) -> String {
@@ -234,6 +398,8 @@ pub fn load_custom_presets() -> Vec<super::definition::WorkflowPreset> {
 }
 
 pub fn save_custom_preset(preset: super::definition::WorkflowPreset) -> Result<(), String> {
+    ensure_valid_workflow_definition(&preset.workflow)?;
+
     let path = get_presets_file_path().ok_or("无法获取预设文件路径")?;
     let mut presets = load_custom_presets();
     
